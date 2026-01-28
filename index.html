@@ -1,0 +1,469 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="X-UA-Compatible" content="ie=edge">
+    <title>Focus Memo - Zettelkasten</title>
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- React & Babel for Browser Rendering -->
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <!-- Firebase SDK (Compat version) -->
+    <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-auth-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore-compat.js"></script>
+    <!-- Lucide Icons -->
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;700;900&display=swap');
+        body { 
+            font-family: 'Inter', sans-serif; 
+            background-color: #080808; 
+            color: #eee;
+            margin: 0;
+            overflow-x: hidden;
+            -webkit-font-smoothing: antialiased;
+        }
+        .no-scrollbar::-webkit-scrollbar { display: none; }
+        .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+        .glass {
+            background: rgba(13, 13, 13, 0.85);
+            backdrop-filter: blur(24px);
+            -webkit-backdrop-filter: blur(24px);
+            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+        }
+        #loader {
+            position: fixed;
+            inset: 0;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            background: #080808;
+            z-index: 9999;
+            transition: opacity 0.5s ease;
+        }
+        .loader-text {
+            color: #6366f1;
+            font-weight: bold;
+            letter-spacing: 0.1em;
+            margin-bottom: 1rem;
+        }
+        .modal-enter { animation: modalIn 0.3s cubic-bezier(0.16, 1, 0.3, 1); }
+        @keyframes modalIn {
+            from { opacity: 0; transform: scale(0.95) translateY(10px); }
+            to { opacity: 1; transform: scale(1) translateY(0); }
+        }
+    </style>
+</head>
+<body>
+    <div id="loader">
+        <p class="loader-text">INITIALIZING...</p>
+        <div class="w-12 h-1 bg-white/10 rounded-full overflow-hidden">
+            <div class="h-full bg-indigo-600 animate-pulse w-full"></div>
+        </div>
+        <p id="loader-error" class="text-[10px] text-gray-600 mt-4 hidden">연결 시간이 너무 깁니다. 설정을 확인하세요.</p>
+    </div>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useRef, useMemo } = React;
+
+        // --- Firebase Config Helper ---
+        const getFirebaseConfig = () => {
+            if (typeof __firebase_config !== 'undefined' && __firebase_config !== "") {
+                try { return JSON.parse(__firebase_config); } catch (e) { console.error("Config parse error"); }
+            }
+            return {
+                apiKey: "YOUR_API_KEY",
+                authDomain: "YOUR_PROJECT_ID.firebaseapp.com",
+                projectId: "YOUR_PROJECT_ID",
+                storageBucket: "YOUR_PROJECT_ID.appspot.com",
+                messagingSenderId: "YOUR_SENDER_ID",
+                appId: "YOUR_APP_ID"
+            };
+        };
+
+        const firebaseConfig = getFirebaseConfig();
+
+        try {
+            if (!firebase.apps.length) {
+                firebase.initializeApp(firebaseConfig);
+            }
+        } catch (err) {
+            console.error("Firebase initialization failed:", err);
+        }
+
+        const auth = firebase.auth();
+        const db = firebase.firestore();
+        const googleProvider = new firebase.auth.GoogleAuthProvider();
+        googleProvider.addScope('profile');
+        googleProvider.addScope('email');
+
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'focus-memo-prod';
+        const INITIAL_CATEGORY = { id: 'inbox', label: '기본', color: 'text-indigo-400', bg: 'bg-indigo-400/10' };
+
+        const removeLoader = () => {
+            const loader = document.getElementById('loader');
+            if (loader) {
+                loader.style.opacity = '0';
+                setTimeout(() => loader.remove(), 500);
+            }
+        };
+
+        const LucideIcon = ({ name, size = 16, className = "" }) => {
+            const iconRef = useRef(null);
+            useEffect(() => {
+                if (window.lucide && iconRef.current) {
+                    window.lucide.createIcons({
+                        icons: { [name]: window.lucide.icons[name] },
+                        nameAttr: 'data-lucide'
+                    });
+                }
+            }, [name]);
+            return (
+                <span ref={iconRef} className={`inline-flex items-center justify-center ${className}`}>
+                    <i data-lucide={name} style={{ width: size, height: size }}></i>
+                </span>
+            );
+        };
+
+        const App = () => {
+            const [user, setUser] = useState(null);
+            const [isAuthLoading, setIsAuthLoading] = useState(true);
+            const [memos, setMemos] = useState([]);
+            const [categories, setCategories] = useState([INITIAL_CATEGORY]);
+            const [inputText, setInputText] = useState('');
+            const [filterCategory, setFilterCategory] = useState('all');
+            const [isListening, setIsListening] = useState(false);
+            const [snackbar, setSnackbar] = useState({ show: false, message: '', type: 'success' });
+            const [isEditingCategories, setIsEditingCategories] = useState(false);
+            const [newCatName, setNewCatName] = useState('');
+            const [activeMenuId, setActiveMenuId] = useState(null);
+            const recognitionRef = useRef(null);
+
+            useEffect(() => {
+                const timeoutId = setTimeout(() => {
+                    const errHint = document.getElementById('loader-error');
+                    if (errHint) errHint.classList.remove('hidden');
+                    setTimeout(() => {
+                        if (isAuthLoading) {
+                            setIsAuthLoading(false);
+                            removeLoader();
+                        }
+                    }, 2000);
+                }, 5000);
+
+                const setupAuth = async () => {
+                    // 현재 환경이 지원되는 프로토콜인지 확인
+                    const isSupportedProtocol = ['http:', 'https:', 'chrome-extension:'].includes(window.location.protocol);
+
+                    try {
+                        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                            await auth.signInWithCustomToken(__initial_auth_token);
+                        } 
+                        
+                        if (isSupportedProtocol) {
+                            // 리다이렉트 결과 확인 (환경이 지원될 때만)
+                            const result = await auth.getRedirectResult();
+                            if (result?.user) {
+                                setUser(result.user);
+                            } else if (!auth.currentUser) {
+                                await auth.signInAnonymously();
+                            }
+                        } else {
+                            // file:// 등의 비지원 환경에서는 세션 확인만 수행
+                            if (!auth.currentUser) {
+                                console.warn("인증 기능은 http/https 환경에서만 원활하게 작동합니다. 로컬 서버(Live Server 등)를 이용해 주세요.");
+                                // 익명 로그인이 가능할 수도 있으므로 일단 시도
+                                await auth.signInAnonymously().catch(e => console.error("Anonymous sign-in failed in this env:", e));
+                            }
+                        }
+                    } catch (e) { 
+                        console.error("Auth initialization error:", e);
+                    } finally {
+                        setIsAuthLoading(false);
+                        removeLoader();
+                    }
+                };
+                
+                setupAuth();
+
+                const unsubscribeAuth = auth.onAuthStateChanged((u) => {
+                    setUser(u);
+                    setIsAuthLoading(false);
+                    clearTimeout(timeoutId);
+                    removeLoader();
+                });
+
+                const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+                if (SpeechRecognition) {
+                    recognitionRef.current = new SpeechRecognition();
+                    recognitionRef.current.lang = 'ko-KR';
+                    recognitionRef.current.onresult = (e) => {
+                        const transcript = e.results[0][0].transcript;
+                        saveMemo(transcript, 'Voice');
+                        setIsListening(false);
+                    };
+                    recognitionRef.current.onerror = () => setIsListening(false);
+                    recognitionRef.current.onend = () => setIsListening(false);
+                }
+
+                return () => {
+                    unsubscribeAuth();
+                    clearTimeout(timeoutId);
+                };
+            }, []);
+
+            useEffect(() => {
+                if (!user) return;
+
+                const unsubCats = db.collection('artifacts').doc(appId).collection('users').doc(user.uid).collection('categories')
+                    .onSnapshot(snap => {
+                        const loaded = snap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                        setCategories([INITIAL_CATEGORY, ...loaded]);
+                    }, (err) => console.error("Category Sync Error:", err));
+
+                const unsubMemos = db.collection('artifacts').doc(appId).collection('public').doc('data').collection('memos')
+                    .where('userId', '==', user.uid)
+                    .onSnapshot(snap => {
+                        const list = snap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                        list.sort((a, b) => (b.createdAt?.seconds || 0) - (a.createdAt?.seconds || 0));
+                        setMemos(list);
+                    }, (err) => console.error("Memo Sync Error:", err));
+
+                return () => { unsubCats(); unsubMemos(); };
+            }, [user]);
+
+            const showSnackbar = (message, type = 'success') => {
+                setSnackbar({ show: true, message, type });
+                setTimeout(() => setSnackbar({ show: false, message: '', type: 'success' }), 2000);
+            };
+
+            const saveMemo = async (text, type = 'Keyboard') => {
+                const content = typeof text === 'string' ? text : inputText;
+                if (!content.trim() || !user) return;
+                try {
+                    await db.collection('artifacts').doc(appId).collection('public').doc('data').collection('memos').add({
+                        userId: user.uid,
+                        content,
+                        inputType: type,
+                        categoryId: 'inbox',
+                        createdAt: firebase.firestore.FieldValue.serverTimestamp()
+                    });
+                    setInputText('');
+                    showSnackbar('메모 상자에 보관됨');
+                } catch (e) { 
+                    showSnackbar('저장 실패 (로그인 필요)', 'error');
+                }
+            };
+
+            const moveMemo = async (memoId, catId) => {
+                try {
+                    await db.collection('artifacts').doc(appId).collection('public').doc('data').collection('memos').doc(memoId).update({ categoryId: catId });
+                    setActiveMenuId(null);
+                    showSnackbar('분류 완료');
+                } catch (e) { showSnackbar('이동 실패', 'error'); }
+            };
+
+            const deleteMemo = async (id) => {
+                try {
+                    await db.collection('artifacts').doc(appId).collection('public').doc('data').collection('memos').doc(id).delete();
+                    showSnackbar('삭제 완료');
+                } catch (e) { showSnackbar('삭제 실패', 'error'); }
+            };
+
+            const addCategory = async () => {
+                if (!newCatName.trim() || !user) return;
+                try {
+                    await db.collection('artifacts').doc(appId).collection('users').doc(user.uid).collection('categories').add({
+                        label: newCatName,
+                        color: 'text-emerald-400',
+                        bg: 'bg-emerald-400/10',
+                        createdAt: firebase.firestore.FieldValue.serverTimestamp()
+                    });
+                    setNewCatName('');
+                    showSnackbar('인덱스 추가됨');
+                } catch (e) { showSnackbar('추가 실패', 'error'); }
+            };
+
+            const deleteCategory = async (id) => {
+                if (id === 'inbox') return;
+                try {
+                    await db.collection('artifacts').doc(appId).collection('users').doc(user.uid).collection('categories').doc(id).delete();
+                    showSnackbar('인덱스 삭제됨');
+                } catch (e) { showSnackbar('삭제 실패', 'error'); }
+            };
+
+            const handleLogin = async () => {
+                if (!['http:', 'https:'].includes(window.location.protocol)) {
+                    showSnackbar('로컬 파일 실행(file://) 환경에서는 구글 로그인을 지원하지 않습니다. GitHub에 배포하거나 로컬 서버를 사용하세요.', 'error');
+                    return;
+                }
+                try {
+                    await auth.signInWithPopup(googleProvider);
+                } catch (err) {
+                    console.error("Login error:", err.code, err.message);
+                    if (err.code === 'auth/popup-blocked' || err.code === 'auth/operation-not-supported-in-this-environment') {
+                        try {
+                            await auth.signInWithRedirect(googleProvider);
+                        } catch (reErr) {
+                            showSnackbar('로그인 방식을 지원하지 않습니다. Firebase 콘솔 설정을 확인하세요.', 'error');
+                        }
+                    } else if (err.code === 'auth/unauthorized-domain') {
+                        showSnackbar('승인되지 않은 도메인입니다. Firebase 콘솔에 도메인을 추가하세요.', 'error');
+                    } else {
+                        showSnackbar(`로그인 오류: ${err.message}`, 'error');
+                    }
+                }
+            };
+
+            const filteredMemos = useMemo(() => {
+                return filterCategory === 'all' ? memos : memos.filter(m => m.categoryId === filterCategory);
+            }, [memos, filterCategory]);
+
+            if (isAuthLoading && !user) return null;
+
+            return (
+                <div className="min-h-screen pb-40">
+                    <header className="p-4 glass sticky top-0 z-50 flex justify-between items-center">
+                        <div className="flex items-center gap-3">
+                            <div className="w-10 h-10 bg-indigo-600 rounded-2xl flex items-center justify-center shadow-lg shadow-indigo-500/30">
+                                <LucideIcon name="inbox" className="text-white" size={20}/>
+                            </div>
+                            <div>
+                                <h1 className="text-lg font-black leading-none tracking-tight text-white">Focus Memo</h1>
+                                <p className="text-[10px] text-gray-500 font-bold uppercase tracking-widest mt-1">Zettelkasten Method</p>
+                            </div>
+                        </div>
+                        {user && !user.isAnonymous ? (
+                            <div className="flex items-center gap-3">
+                                <span className="text-[10px] text-gray-500 hidden md:block">{user.email || '연결됨'}</span>
+                                <button onClick={() => auth.signOut()} className="p-2 bg-white/5 rounded-full border border-white/5 hover:bg-red-500/10 transition-colors">
+                                    <LucideIcon name="log-out" size={18} className="text-gray-400"/>
+                                </button>
+                            </div>
+                        ) : (
+                            <button onClick={handleLogin} className="bg-white text-black px-4 py-2 rounded-full text-[11px] font-black uppercase tracking-tight hover:bg-gray-200 transition-colors">Connect</button>
+                        )}
+                    </header>
+
+                    <nav className="bg-[#080808] border-b border-white/5 px-4 py-4 sticky top-[73px] z-40 overflow-x-auto no-scrollbar">
+                        <div className="flex gap-2 max-w-2xl mx-auto">
+                            <button onClick={() => setFilterCategory('all')} className={`px-5 py-2 rounded-xl text-xs font-bold whitespace-nowrap transition-all ${filterCategory === 'all' ? 'bg-indigo-600 text-white shadow-lg' : 'bg-white/5 text-gray-500 hover:bg-white/10'}`}>전체 상자</button>
+                            {categories.map(cat => (
+                                <button key={cat.id} onClick={() => setFilterCategory(cat.id)} className={`px-5 py-2 rounded-xl text-xs font-bold flex items-center gap-2 whitespace-nowrap transition-all ${filterCategory === cat.id ? 'bg-white/10 text-white border border-white/20' : 'bg-white/5 text-gray-500 hover:bg-white/10'}`}>
+                                    <LucideIcon name="tag" size={12} className={cat.color} /> {cat.label}
+                                </button>
+                            ))}
+                            <button onClick={() => setIsEditingCategories(true)} className="p-2 bg-white/5 rounded-xl text-gray-500 hover:text-white transition-colors"><LucideIcon name="settings" size={16}/></button>
+                        </div>
+                    </nav>
+
+                    {isEditingCategories && (
+                        <div className="fixed inset-0 bg-black/90 backdrop-blur-md z-[100] flex items-center justify-center p-6" onClick={() => setIsEditingCategories(false)}>
+                            <div className="bg-[#111] border border-white/10 w-full max-w-sm rounded-[32px] p-6 space-y-6 shadow-2xl modal-enter" onClick={e => e.stopPropagation()}>
+                                <div className="flex justify-between items-center">
+                                    <div className="flex items-center gap-2">
+                                        <LucideIcon name="settings-2" size={18} className="text-indigo-500" />
+                                        <h3 className="font-bold text-sm uppercase tracking-wider text-white">Index Management</h3>
+                                    </div>
+                                    <button onClick={() => setIsEditingCategories(false)} className="text-gray-500 p-2 hover:bg-white/5 rounded-full transition-colors">
+                                        <LucideIcon name="x" size={24}/>
+                                    </button>
+                                </div>
+                                <div className="space-y-2">
+                                    <p className="text-[10px] text-gray-500 font-bold uppercase tracking-widest px-1">Add New Index</p>
+                                    <div className="flex gap-2">
+                                        <input type="text" value={newCatName} onChange={e => setNewCatName(e.target.value)} onKeyPress={e => e.key === 'Enter' && addCategory()} placeholder="인덱스 이름 입력..." className="flex-1 bg-white/5 border border-white/10 rounded-2xl px-4 py-3 text-sm outline-none focus:border-indigo-500 transition-all text-white" />
+                                        <button onClick={addCategory} className="bg-indigo-600 px-5 rounded-2xl text-xs font-bold text-white hover:bg-indigo-500 transition-colors">추가</button>
+                                    </div>
+                                </div>
+                                <div className="space-y-2">
+                                    <p className="text-[10px] text-gray-500 font-bold uppercase tracking-widest px-1">Current Indexes</p>
+                                    <div className="space-y-2 max-h-[260px] overflow-y-auto no-scrollbar pr-1">
+                                        {categories.map(cat => (
+                                            <div key={cat.id} className="flex items-center justify-between bg-white/5 p-4 rounded-[20px] border border-white/5 group">
+                                                <div className="flex items-center gap-3">
+                                                    <LucideIcon name="tag" size={14} className={cat.color}/>
+                                                    <span className="text-sm font-medium text-white">{cat.label}</span>
+                                                </div>
+                                                {cat.id !== 'inbox' && (
+                                                    <button onClick={() => deleteCategory(cat.id)} className="text-gray-700 hover:text-red-500 p-1.5 hover:bg-red-500/10 rounded-lg transition-all opacity-40 group-hover:opacity-100">
+                                                        <LucideIcon name="trash-2" size={16}/>
+                                                    </button>
+                                                )}
+                                            </div>
+                                        ))}
+                                    </div>
+                                </div>
+                                <button onClick={() => setIsEditingCategories(false)} className="w-full py-4 bg-white/5 hover:bg-white/10 border border-white/10 rounded-2xl text-xs font-black uppercase tracking-[0.2em] text-gray-400 hover:text-white transition-all">메인 화면으로 돌아가기</button>
+                            </div>
+                        </div>
+                    )}
+
+                    <main className="p-4 max-w-2xl mx-auto w-full space-y-4">
+                        {filteredMemos.map(memo => {
+                            const cat = categories.find(c => c.id === memo.categoryId) || INITIAL_CATEGORY;
+                            return (
+                                <div key={memo.id} className="group bg-[#121212] border border-white/5 p-6 rounded-[32px] hover:border-white/10 hover:bg-[#161616] transition-all relative">
+                                    <div className="flex justify-between items-start mb-4">
+                                        <div className="relative">
+                                            <button onClick={() => setActiveMenuId(activeMenuId === memo.id ? null : memo.id)} className={`flex items-center gap-2 px-3 py-1.5 rounded-full text-[10px] font-black uppercase tracking-tighter transition-all hover:scale-105 ${cat.bg} ${cat.color}`}>
+                                                <LucideIcon name={cat.id === 'inbox' ? 'inbox' : 'tag'} size={10}/>{cat.label}<LucideIcon name="chevron-right" size={10} className={`transition-transform duration-300 ${activeMenuId === memo.id ? 'rotate-90' : ''}`}/>
+                                            </button>
+                                            {activeMenuId === memo.id && (
+                                                <div className="absolute top-10 left-0 bg-[#1a1a1a] border border-white/10 rounded-2xl shadow-2xl p-2 z-30 min-w-[140px] animate-in fade-in slide-in-from-top-2">
+                                                    {categories.map(c => <button key={c.id} onClick={() => moveMemo(memo.id, c.id)} className="w-full text-left px-3 py-2.5 rounded-xl text-[11px] font-bold hover:bg-white/5 flex items-center gap-3 text-gray-400 hover:text-white transition-colors"><div className={`w-1.5 h-1.5 rounded-full ${c.color.replace('text-', 'bg-')}`}></div>{c.label}</button>)}
+                                                </div>
+                                            )}
+                                        </div>
+                                        <button onClick={() => deleteMemo(memo.id)} className="text-gray-800 hover:text-red-500 opacity-0 group-hover:opacity-100 transition-all p-1"><LucideIcon name="trash-2" size={16}/></button>
+                                    </div>
+                                    <p className="text-gray-300 text-[15px] leading-relaxed whitespace-pre-wrap font-medium">{memo.content}</p>
+                                    <div className="mt-4 pt-4 border-t border-white/[0.03] flex items-center gap-2 text-[9px] text-gray-700 font-bold uppercase tracking-widest">
+                                        <LucideIcon name="clock" size={10}/>
+                                        {memo.createdAt?.toDate ? memo.createdAt.toDate().toLocaleString('ko-KR') : 'Capturing...'}
+                                    </div>
+                                </div>
+                            );
+                        })}
+                        {filteredMemos.length === 0 && (
+                            <div className="py-32 text-center opacity-10 flex flex-col items-center gap-4">
+                                <LucideIcon name="inbox" size={64} />
+                                <p className="text-sm font-black uppercase tracking-[0.4em]">BOX IS EMPTY</p>
+                            </div>
+                        )}
+                    </main>
+
+                    <div className="fixed bottom-0 left-0 right-0 p-6 bg-gradient-to-t from-[#080808] via-[#080808]/95 to-transparent z-40">
+                        <div className="max-w-2xl mx-auto">
+                            <div className="bg-[#161616] border border-white/5 rounded-[32px] shadow-2xl p-2.5 flex items-center gap-3 ring-4 ring-black/50 focus-within:ring-indigo-500/20 transition-all">
+                                <button onClick={() => { if(isListening) { recognitionRef.current?.stop(); } else { setIsListening(true); recognitionRef.current?.start(); } }} className={`p-4.5 rounded-[24px] transition-all active:scale-95 ${isListening ? 'bg-red-500 text-white animate-pulse shadow-lg shadow-red-500/30' : 'bg-white/5 text-gray-400 hover:text-white'}`}>
+                                    <LucideIcon name={isListening ? "mic-off" : "mic"} size={24}/>
+                                </button>
+                                <input type="text" value={inputText} onChange={e => setInputText(e.target.value)} onKeyPress={e => e.key === 'Enter' && saveMemo()} placeholder={isListening ? "듣고 있습니다..." : "영감을 기록하세요 (Inbox)"} className="flex-1 bg-transparent border-none focus:ring-0 text-white placeholder-gray-700 py-4 px-2 text-base font-medium outline-none" />
+                                <button onClick={() => saveMemo()} disabled={!inputText.trim()} className={`p-4.5 rounded-[24px] transition-all active:scale-90 ${inputText.trim() ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-600/40' : 'text-gray-800 pointer-events-none opacity-20'}`}>
+                                    <LucideIcon name="send" size={24}/>
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+
+                    {snackbar.show && (
+                        <div className="fixed bottom-32 left-1/2 -translate-x-1/2 z-[110] px-6 py-3 rounded-2xl shadow-2xl flex items-center gap-3 border backdrop-blur-xl bg-white/5 border-white/10 text-white animate-in slide-in-from-bottom-2 fade-in duration-300">
+                            <LucideIcon name={snackbar.type === 'error' ? "alert-circle" : "check-circle"} size={16} className="text-indigo-400"/><span className="text-xs font-bold">{snackbar.message}</span>
+                        </div>
+                    )}
+                </div>
+            );
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
